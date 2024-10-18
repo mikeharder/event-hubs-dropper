@@ -4,6 +4,8 @@
   "description": "Prototype using external storage to drop messages after a certain number of processing attempts",
   "main": "index.js",
   "scripts": {
+    "docker:down": "docker compose down",
+    "docker:up": "docker compose up -d",
     "start": "node index.js"
   },
   "author": "",
