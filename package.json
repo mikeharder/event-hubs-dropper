@@ -1,0 +1,14 @@
+{
+  "name": "event-hubs-dropper",
+  "version": "1.0.0",
+  "description": "Prototype using external storage to drop messages after a certain number of processing attempts",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@azure/event-hubs": "^5.12.2"
+  }
+}
