@@ -11,6 +11,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@azure/event-hubs": "^5.12.2"
+    "@azure/event-hubs": "^5.12.2",
+    "@azure/eventhubs-checkpointstore-blob": "^1.0.1"
   }
 }
