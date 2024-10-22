@@ -129,7 +129,8 @@ class BlobAttemptStore {
     try {
       const props = await blobClient.getProperties();
     }
-    catch {
+    catch (e) {
+      console.log(`Error calling blobClient.getProperties('${blobName}'): ${e}`);
     }
     return 0;
   }
