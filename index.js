@@ -12,6 +12,8 @@ const {
 
 const { ContainerClient } = require("@azure/storage-blob");
 
+const path = require("path");
+
 const readline = require("readline/promises");
 
 const ehConnectionString =
@@ -114,6 +116,38 @@ class BlobAttemptStore {
    */
   constructor(containerClient) {
     this.#containerClient = containerClient;
+  }
+
+  /**
+   * @param {import("@azure/event-hubs").ReceivedEventData} event
+   * @param {import("@azure/event-hubs").PartitionContext} context
+   * @returns {Promise<number>} Number of times the event has been attempted. Returns '0' before the first attempt.
+   */
+  async getAttempts(event, context) {
+    const blobName = this.#getBlobName(context);
+    const blobClient = this.#containerClient.getBlobClient(blobName);
+    try {
+      const props = await blobClient.getProperties();
+    }
+    catch {
+    }
+    return 0;
+  }
+
+  /**
+   * @param {import("@azure/event-hubs").ReceivedEventData} event
+   * @param {import("@azure/event-hubs").PartitionContext} context
+   * @param {number} attempts
+   */
+  async setAttempts(event, context, attempts) {
+  }
+
+  /**
+   * @param {import("@azure/event-hubs").PartitionContext} context
+   * @returns {string} Unique blob name derived from properties of the context. Example: "my-eh.servicebus.windows.net/eh1/$default/attempt/0"
+   */
+  #getBlobName(context) {
+    return path.join(context.fullyQualifiedNamespace, context.eventHubName, context.consumerGroup, "attempt", context.partitionId);
   }
 }
 
