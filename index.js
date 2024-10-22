@@ -11,6 +11,7 @@ const {
 } = require("@azure/eventhubs-checkpointstore-blob");
 
 const { ContainerClient } = require("@azure/storage-blob");
+const { promises } = require("readline");
 
 const readline = require("readline/promises");
 
@@ -26,7 +27,7 @@ async function main() {
       output: process.stdout,
     });
     const answer = await rl.question(
-      "Commands: { 's':send, 'ra':receive-all, 'ru':receive-update-cp, 'rc':receive-from-last-cp, 'q':quit }\n"
+      "Commands: { 's':send, 'sp':send-poison, 'ra':receive-all, 'ru':receive-update-cp, 'rc':receive-from-last-cp, 'q':quit }\n"
     );
     rl.close();
 
@@ -34,18 +35,26 @@ async function main() {
       case "s":
         await send();
         break;
+      case "sp":
+        await sendPoison();
+        break;
       case "ra":
-        await receive(
-          /*startPosition*/ earliestEventPosition,
+        await receiveLoop(
           /*useCheckpointStore*/ false,
           /*updateCheckpointStore*/ false
         );
         break;
       case "ru":
-        await receive(/*startPosition*/ undefined, /*useCheckpointStore*/ true, /*updateCheckpointStore*/ true);
+        await receiveLoop(
+          /*useCheckpointStore*/ true,
+          /*updateCheckpointStore*/ true
+        );
         break;
       case "rc":
-        await receive(/*startPosition*/ undefined, /*useCheckpointStore*/ true, /*updateCheckpointStore*/ false);
+        await receiveLoop(
+          /*useCheckpointStore*/ true,
+          /*updateCheckpointStore*/ false
+        );
         break;
       case "q":
         process.exit(0);
@@ -57,41 +66,75 @@ async function main() {
 }
 
 async function send() {
-  // Create a producer client to send messages to the event hub.
   const producer = new EventHubProducerClient(ehConnectionString, ehName);
 
-  // Prepare a batch of three events.
   const batch = await producer.createBatch();
   batch.tryAdd({ body: "First event" });
   batch.tryAdd({ body: "Second event" });
   batch.tryAdd({ body: "Third event" });
 
-  // Send the batch to the event hub.
   await producer.sendBatch(batch);
 
-  // Close the producer client.
   await producer.close();
 
   console.log("A batch of three events have been sent to the event hub");
 }
 
+async function sendPoison() {
+  const producer = new EventHubProducerClient(ehConnectionString, ehName);
+
+  const batch = await producer.createBatch();
+  batch.tryAdd({ body: "poison" });
+  await producer.sendBatch(batch);
+  await producer.close();
+
+  console.log("A poison event have been sent to the event hub");
+}
+
 /**
- * @param {import("@azure/event-hubs").EventPosition | undefined} startPosition
  * @param {boolean} useCheckpointStore
  * @param {boolean} updateCheckpointStore
  */
-async function receive(startPosition, useCheckpointStore, updateCheckpointStore) {
+async function receiveLoop(
+  useCheckpointStore,
+  updateCheckpointStore
+) {
+  while (true) {
+    try {
+      await receive(useCheckpointStore, updateCheckpointStore);
+      return;
+    } catch (e) {
+      console.log(`Error receiving events: ${e}`);
+      await sleep(1000);
+    }
+  }
+}
+
+/**
+ * @param {boolean} useCheckpointStore
+ * @param {boolean} updateCheckpointStore
+ */
+async function receive(
+  useCheckpointStore,
+  updateCheckpointStore
+) {
   const checkpointStoreConnectionString =
     "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;QueueEndpoint=http://127.0.0.1:10001/devstoreaccount1;TableEndpoint=http://127.0.0.1:10002/devstoreaccount1;";
   const checkpointStoreContainerName = "my-checkpoint-store";
 
-  const checkpointStore = useCheckpointStore
-    ? new BlobCheckpointStore(
-        new ContainerClient(
-          checkpointStoreConnectionString,
-          checkpointStoreContainerName
-        )
+  const containerClient = useCheckpointStore
+    ? new ContainerClient(
+        checkpointStoreConnectionString,
+        checkpointStoreContainerName
       )
+    : undefined;
+
+  if (containerClient) {
+    await containerClient.createIfNotExists();
+  }
+
+  const checkpointStore = containerClient
+    ? new BlobCheckpointStore(containerClient)
     : undefined;
 
   const consumerClient = checkpointStore
@@ -105,6 +148,8 @@ async function receive(startPosition, useCheckpointStore, updateCheckpointStore)
     : new EventHubConsumerClient(ehConsumerGroup, ehConnectionString, ehName, {
         loadBalancingOptions: { strategy: "greedy" },
       });
+
+  const subscriptionTerminated = createManualPromise();
 
   const subscription = consumerClient.subscribe(
     {
@@ -120,11 +165,18 @@ async function receive(startPosition, useCheckpointStore, updateCheckpointStore)
           console.log(
             `Received event: '${event.body}' from offset '${event.offset}' and sequence '${event.sequenceNumber}' in  partition: '${context.partitionId}' and consumer group: '${context.consumerGroup}'`
           );
+
+          if (event.body == "poison") {
+            console.log("poison!!!");
+            throw new Error("poisoned message");
+          }
         }
 
         if (updateCheckpointStore) {
           if (!useCheckpointStore) {
-            throw new Error("Cannot set updateCheckpointStore=true if useCheckpointStore=false");
+            throw new Error(
+              "Cannot set updateCheckpointStore=true if useCheckpointStore=false"
+            );
           }
           try {
             await context.updateCheckpoint(events[events.length - 1]);
@@ -143,10 +195,13 @@ async function receive(startPosition, useCheckpointStore, updateCheckpointStore)
         }
       },
       processError: async (err, context) => {
-        console.log(`Error : ${err}`);
+        console.log(`processError: ${err}`);
+        // subscription.close();
+        // @ts-ignore
+        subscriptionTerminated.resolve(err);
       },
     },
-    { startPosition: startPosition }
+    { startPosition: earliestEventPosition }
   );
 
   while (true) {
@@ -154,70 +209,50 @@ async function receive(startPosition, useCheckpointStore, updateCheckpointStore)
       input: process.stdin,
       output: process.stdout,
     });
-    const answer = await rl.question("Press 'q' to quit...}\n");
+    const answer = await Promise.any([
+      subscriptionTerminated.promise,
+      rl.question("Press 'q' to quit...}\n"),
+    ]);
+    console.log(`answer: ${answer}`);
     rl.close();
-    switch (answer.trim()) {
-      case "q":
-        await subscription.close();
-        await consumerClient.close();
-        return;
-      default:
-        console.log(`Unknown command: ${answer.trim()}`);
-        break;
+    if (typeof answer === "string") {
+      switch (answer.trim()) {
+        case "q":
+          await subscription.close();
+          await consumerClient.close();
+          return;
+        default:
+          console.log(`Unknown command: ${answer.trim()}`);
+          break;
+      }
+    } else {
+      console.log("subscription terminated");
+      subscription.close();
+      throw answer;
     }
   }
 }
 
-//   // Subscribe to the events, and specify handlers for processing the events and errors.
-//   const subscription = consumerClient.subscribe(
-//     {
-//       processEvents: async (events, context) => {
-//         if (events.length === 0) {
-//           console.log(
-//             `No events received within wait time. Waiting for next interval`
-//           );
-//           return;
-//         }
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-//         for (const event of events) {
-//           console.log(
-//             `Received event: '${event.body}' from partition: '${context.partitionId}' and consumer group: '${context.consumerGroup}'`
-//           );
-//         }
+function createManualPromise() {
+  let resolve, reject;
 
-//         try {
-//           await context.updateCheckpoint(events[events.length - 1]);
-//         } catch (err) {
-//           console.log(
-//             `Error when checkpointing on partition ${context.partitionId}: `,
-//             err
-//           );
-//           throw err;
-//         }
+  // Create a new promise and capture the resolve and reject functions
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
 
-//         console.log(
-//           `Successfully checkpointed event with sequence number: ${
-//             events[events.length - 1].sequenceNumber
-//           } from partition: 'partitionContext.partitionId'`
-//         );
-//       },
-
-//       processError: async (err, context) => {
-//         console.log(`Error : ${err}`);
-//       },
-//     },
-//     { startPosition: earliestEventPosition }
-//   );
-
-//   // After 30 seconds, stop processing.
-//   await new Promise((resolve) => {
-//     setTimeout(async () => {
-//       await subscription.close();
-//       await consumerClient.close();
-//       resolve();
-//     }, 30000);
-//   });
-// }
+  // Return the promise along with the resolve and reject functions
+  return {
+    promise,
+    resolve,
+    reject,
+  };
+}
 
 main().catch((err) => {
   console.log("Error occurred: ", err);
