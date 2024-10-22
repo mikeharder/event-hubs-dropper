@@ -11,7 +11,6 @@ const {
 } = require("@azure/eventhubs-checkpointstore-blob");
 
 const { ContainerClient } = require("@azure/storage-blob");
-const { promises } = require("readline");
 
 const readline = require("readline/promises");
 
@@ -95,10 +94,7 @@ async function sendPoison() {
  * @param {boolean} useCheckpointStore
  * @param {boolean} updateCheckpointStore
  */
-async function receiveLoop(
-  useCheckpointStore,
-  updateCheckpointStore
-) {
+async function receiveLoop(useCheckpointStore, updateCheckpointStore) {
   while (true) {
     try {
       await receive(useCheckpointStore, updateCheckpointStore);
@@ -110,17 +106,26 @@ async function receiveLoop(
   }
 }
 
+class BlobAttemptStore {
+  #containerClient;
+
+  /**
+   * @param {ContainerClient} containerClient
+   */
+  constructor(containerClient) {
+    this.#containerClient = containerClient;
+  }
+}
+
 /**
  * @param {boolean} useCheckpointStore
  * @param {boolean} updateCheckpointStore
  */
-async function receive(
-  useCheckpointStore,
-  updateCheckpointStore
-) {
+async function receive(useCheckpointStore, updateCheckpointStore) {
   const checkpointStoreConnectionString =
     "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;QueueEndpoint=http://127.0.0.1:10001/devstoreaccount1;TableEndpoint=http://127.0.0.1:10002/devstoreaccount1;";
   const checkpointStoreContainerName = "my-checkpoint-store";
+  const attemptStoreContainerName = "my-attempt-store";
 
   const containerClient = useCheckpointStore
     ? new ContainerClient(
@@ -149,6 +154,21 @@ async function receive(
         loadBalancingOptions: { strategy: "greedy" },
       });
 
+  const attemptContainerClient = useCheckpointStore
+    ? new ContainerClient(
+        checkpointStoreConnectionString,
+        attemptStoreContainerName
+      )
+    : undefined;
+
+  if (attemptContainerClient) {
+    await attemptContainerClient.createIfNotExists();
+  }
+
+  const attemptStore = attemptContainerClient
+    ? new BlobAttemptStore(attemptContainerClient)
+    : undefined;
+
   const subscriptionTerminated = createManualPromise();
 
   const subscription = consumerClient.subscribe(
@@ -160,6 +180,9 @@ async function receive(
           );
           return;
         }
+
+        // TODO: Track attempts based on events[0] in storage blobs.  If exceed max attempts (say 5), drop message and advance checkpoint to prevent getting stuck.
+        // attemptStore
 
         for (const event of events) {
           console.log(
