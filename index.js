@@ -1,5 +1,7 @@
 // @ts-check
 
+const { BlobAttemptStore } = require("./blob-attempt-store");
+
 const {
   EventHubConsumerClient,
   EventHubProducerClient,
@@ -11,8 +13,6 @@ const {
 } = require("@azure/eventhubs-checkpointstore-blob");
 
 const { ContainerClient } = require("@azure/storage-blob");
-
-const path = require("path");
 
 const readline = require("readline/promises");
 
@@ -28,7 +28,7 @@ async function main() {
       output: process.stdout,
     });
     const answer = await rl.question(
-      "Commands: { 's':send, 'sp':send-poison, 'ra':receive-all, 'ru':receive-update-cp, 'rc':receive-from-last-cp, 'q':quit }\n"
+      "Commands: { 's':send, 'sp':send-poison, 'ra':receive-all, 'ru':receive-update-cp, 'rc':receive-from-last-cp, 'rua':receive-update-events, 'q':quit }\n"
     );
     rl.close();
 
@@ -42,19 +42,29 @@ async function main() {
       case "ra":
         await receiveLoop(
           /*useCheckpointStore*/ false,
-          /*updateCheckpointStore*/ false
-        );
-        break;
-      case "ru":
-        await receiveLoop(
-          /*useCheckpointStore*/ true,
-          /*updateCheckpointStore*/ true
+          /*updateCheckpointStore*/ false,
+          /*updateAttemptStore*/ false
         );
         break;
       case "rc":
         await receiveLoop(
           /*useCheckpointStore*/ true,
-          /*updateCheckpointStore*/ false
+          /*updateCheckpointStore*/ false,
+          /*updateAttemptStore*/ false
+        );
+        break;
+      case "ru":
+        await receiveLoop(
+          /*useCheckpointStore*/ true,
+          /*updateCheckpointStore*/ true,
+          /*updateAttemptStore*/ false
+        );
+        break;
+      case "rua":
+        await receiveLoop(
+          /*useCheckpointStore*/ true,
+          /*updateCheckpointStore*/ true,
+          /*updateAttemptStore*/ true
         );
         break;
       case "q":
@@ -95,11 +105,20 @@ async function sendPoison() {
 /**
  * @param {boolean} useCheckpointStore
  * @param {boolean} updateCheckpointStore
+ * @param {boolean} updateAttemptStore
  */
-async function receiveLoop(useCheckpointStore, updateCheckpointStore) {
+async function receiveLoop(
+  useCheckpointStore,
+  updateCheckpointStore,
+  updateAttemptStore
+) {
   while (true) {
     try {
-      await receive(useCheckpointStore, updateCheckpointStore);
+      await receive(
+        useCheckpointStore,
+        updateCheckpointStore,
+        updateAttemptStore
+      );
       return;
     } catch (e) {
       console.log(`Error receiving events: ${e}`);
@@ -108,55 +127,15 @@ async function receiveLoop(useCheckpointStore, updateCheckpointStore) {
   }
 }
 
-class BlobAttemptStore {
-  #containerClient;
-
-  /**
-   * @param {ContainerClient} containerClient
-   */
-  constructor(containerClient) {
-    this.#containerClient = containerClient;
-  }
-
-  /**
-   * @param {import("@azure/event-hubs").ReceivedEventData} event
-   * @param {import("@azure/event-hubs").PartitionContext} context
-   * @returns {Promise<number>} Number of times the event has been attempted. Returns '0' before the first attempt.
-   */
-  async getAttempts(event, context) {
-    const blobName = this.#getBlobName(context);
-    const blobClient = this.#containerClient.getBlobClient(blobName);
-    try {
-      const props = await blobClient.getProperties();
-    }
-    catch (e) {
-      console.log(`Error calling blobClient.getProperties('${blobName}'): ${e}`);
-    }
-    return 0;
-  }
-
-  /**
-   * @param {import("@azure/event-hubs").ReceivedEventData} event
-   * @param {import("@azure/event-hubs").PartitionContext} context
-   * @param {number} attempts
-   */
-  async setAttempts(event, context, attempts) {
-  }
-
-  /**
-   * @param {import("@azure/event-hubs").PartitionContext} context
-   * @returns {string} Unique blob name derived from properties of the context. Example: "my-eh.servicebus.windows.net/eh1/$default/attempt/0"
-   */
-  #getBlobName(context) {
-    return path.join(context.fullyQualifiedNamespace, context.eventHubName, context.consumerGroup, "attempt", context.partitionId);
-  }
-}
-
 /**
  * @param {boolean} useCheckpointStore
  * @param {boolean} updateCheckpointStore
  */
-async function receive(useCheckpointStore, updateCheckpointStore) {
+async function receive(
+  useCheckpointStore,
+  updateCheckpointStore,
+  updateAttemptStore
+) {
   const checkpointStoreConnectionString =
     "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;QueueEndpoint=http://127.0.0.1:10001/devstoreaccount1;TableEndpoint=http://127.0.0.1:10002/devstoreaccount1;";
   const checkpointStoreContainerName = "my-checkpoint-store";
@@ -189,7 +168,7 @@ async function receive(useCheckpointStore, updateCheckpointStore) {
         loadBalancingOptions: { strategy: "greedy" },
       });
 
-  const attemptContainerClient = useCheckpointStore
+  const attemptContainerClient = updateAttemptStore
     ? new ContainerClient(
         checkpointStoreConnectionString,
         attemptStoreContainerName
@@ -209,6 +188,8 @@ async function receive(useCheckpointStore, updateCheckpointStore) {
   const subscription = consumerClient.subscribe(
     {
       processEvents: async (events, context) => {
+        console.log(`processEvents(events.length=${events.length})`);
+
         if (events.length === 0) {
           console.log(
             `No events received within wait time. Waiting for next interval`
@@ -216,8 +197,30 @@ async function receive(useCheckpointStore, updateCheckpointStore) {
           return;
         }
 
-        // TODO: Track attempts based on events[0] in storage blobs.  If exceed max attempts (say 5), drop message and advance checkpoint to prevent getting stuck.
-        // attemptStore
+        if (attemptStore) {
+          let attempts = await attemptStore.getAttempts(events[0], context);
+          console.log(`attempts: ${attempts}`);
+
+          if (attempts < 5) {
+            try {
+              attempts++;
+              await attemptStore.setAttempts(events[0], context, attempts);
+              console.log(`setAttempts: ${attempts}`);
+            } catch (e) {
+              /** @type Error */
+              const error = e;
+              console.log(`Error setting attempts: ${error.stack}`);
+
+              // If any error, it's safe to no-op, since this is the default behavior without tracking attempts
+            }
+          } else {
+            // Drop event by advancing checkpoint, even though the event has never been successfully processed
+            context.updateCheckpoint(events[0]);
+
+            // Return early.  Next callback to processEvents() should start after the dropped event.
+            return;
+          }
+        }
 
         for (const event of events) {
           console.log(
